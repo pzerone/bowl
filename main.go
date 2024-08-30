@@ -16,7 +16,14 @@ func run() error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID,
+		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUSER,
+		Credential: &syscall.Credential{Uid: 0, Gid: 0},
+		UidMappings: []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
+		},
+		GidMappings: []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getgid(), Size: 1},
+		},
 	}
 	return cmd.Run()
 }
@@ -40,7 +47,7 @@ func setup() (string, error) {
 		homeDir, _ := os.UserHomeDir()
 		dataHome = homeDir + "/.local/share"
 	}
-  newDir := fmt.Sprintf("%v/bowl/containers/%v", dataHome, uuid.New())
+	newDir := fmt.Sprintf("%v/bowl/containers/%v", dataHome, uuid.New())
 	if err := os.MkdirAll(newDir, 0775); err != nil {
 		return "", err
 	}
@@ -48,17 +55,16 @@ func setup() (string, error) {
 }
 
 func main() {
-  chrootDir, err := setup()
-  if err != nil {
-    panic(err)
-  }
 	switch os.Args[1] {
 	case "run":
 		if err := run(); err != nil {
 			panic(err)
 		}
 	case "child":
-		if err := child(chrootDir); err != nil {
+		if _, err := setup(); err != nil {
+			panic(err)
+		}
+		if err := child("/home/pzerone/.local/share/bowl/containers/jail"); err != nil {
 			panic(err)
 		}
 	default:
