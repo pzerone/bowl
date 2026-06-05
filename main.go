@@ -2,16 +2,56 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"syscall"
-
-	"github.com/google/uuid"
 )
 
-func run() error {
-	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, os.Args[2:]...)...)
+func usage() {
+	fmt.Fprint(os.Stderr, `bowl - a tiny container runtime
+
+Usage:
+  bowl run --rootfs <path> <command> [args...]
+
+Flags:
+  --rootfs   path to an already-extracted root filesystem (required)
+
+Example:
+  bowl run --rootfs ./alpine /bin/sh
+
+Note: Bowl does not source roofts, you must provide one. Extract one first, e.g.
+  mkdir alpine && docker export $(docker create alpine) | tar -x -C alpine
+`)
+}
+
+func parseArgs(args []string) (rootfs string, cmdline []string, err error) {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.StringVar(&rootfs, "rootfs", "", "path to an extracted root filesystem")
+	if err := fs.Parse(args); err != nil {
+		return "", nil, err
+	}
+	if rootfs == "" {
+		return "", nil, errors.New("--rootfs is required")
+	}
+	cmdline = fs.Args()
+	if len(cmdline) == 0 {
+		return "", nil, errors.New("no command specified")
+	}
+	return rootfs, cmdline, nil
+}
+
+// run re-executes bowl as a "child" inside fresh namespaces.
+func run(args []string) error {
+	rootfs, cmdline, err := parseArgs(args)
+	if err != nil {
+		return err
+	}
+
+	childArgs := append([]string{"child", "--rootfs", rootfs}, cmdline...)
+	cmd := exec.Command("/proc/self/exe", childArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -27,47 +67,58 @@ func run() error {
 	}
 	return cmd.Run()
 }
-func child(dir string) error {
-	fmt.Printf("Running: %v as %v\n", os.Args[2:], os.Getpid())
-	cmd := exec.Command(os.Args[2], os.Args[3:]...)
+
+// Not meant to be invoked directly by users;
+// run() re-execs bowl with this subcommand.
+func child(args []string) error {
+	rootfs, cmdline, err := parseArgs(args)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Running %v as pid %d\n", cmdline, os.Getpid())
+
+	if err := syscall.Sethostname([]byte("container")); err != nil {
+		return fmt.Errorf("sethostname: %w", err)
+	}
+	if err := syscall.Chroot(rootfs); err != nil {
+		return fmt.Errorf("chroot %s: %w", rootfs, err)
+	}
+	if err := syscall.Chdir("/"); err != nil {
+		return fmt.Errorf("chdir /: %w", err)
+	}
+	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+		return fmt.Errorf("mount /proc: %w", err)
+	}
+	defer syscall.Unmount("/proc", 0)
+
+	cmd := exec.Command(cmdline[0], cmdline[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	syscall.Sethostname([]byte("container"))
-	syscall.Chroot(dir)
-	syscall.Chdir("/")
-	syscall.Mount("proc", "proc", "proc", 0, "")
 	return cmd.Run()
 }
 
-func setup() (string, error) {
-	fmt.Println("Setting up dir for chroot")
-	dataHome := os.Getenv("XDG_DATA_HOME")
-	if dataHome == "" { // XDG_DATA_HOME may not be set on some hacky distros
-		homeDir, _ := os.UserHomeDir()
-		dataHome = homeDir + "/.local/share"
-	}
-	newDir := fmt.Sprintf("%v/bowl/containers/%v", dataHome, uuid.New())
-	if err := os.MkdirAll(newDir, 0775); err != nil {
-		return "", err
-	}
-	return newDir, nil
-}
-
 func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(1)
+	}
+
+	var err error
 	switch os.Args[1] {
 	case "run":
-		if err := run(); err != nil {
-			panic(err)
-		}
+		err = run(os.Args[2:])
 	case "child":
-		if _, err := setup(); err != nil {
-			panic(err)
-		}
-		if err := child("/home/pzerone/.local/share/bowl/containers/jail"); err != nil {
-			panic(err)
-		}
+		err = child(os.Args[2:])
+	case "help", "-h", "--help":
+		usage()
+		return
 	default:
-		panic(errors.New("Invalid cmdline arg"))
+		usage()
+		os.Exit(1)
+	}
+
+	if err != nil {
+		log.Fatal(err)
 	}
 }
